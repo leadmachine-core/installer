@@ -19,12 +19,13 @@
   },
   "settings": {
     "version": "2.3.0",
-    "buildCommit": "24722da",
+    "buildCommit": "7fe5168",
     "defaultSpeedMode": "recommended",
     "sandboxMode": false,
     "concurrency": 8,
     "autoUpdate": true,
     "updateChannel": "stable",
-    "lastUpdated": "2026-09-21T17:15:00.000Z"
+    "lastUpdated": "2026-09-21T18:10:18.754Z",
+    "debugMode": true
   }
 }
