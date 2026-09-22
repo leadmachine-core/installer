@@ -1,7 +1,6 @@
 {
   "name": "lead-machine",
-  "version": "2.4.4",
-  "description": "Enterprise Autonomous Lead Generation & Outreach Engine",
+  "version": "2.5.0",
   "private": true,
   "type": "module",
   "dependencies": {
