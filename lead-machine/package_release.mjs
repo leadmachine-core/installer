@@ -35,12 +35,16 @@ fs.mkdirSync(targetLmDir, { recursive: true });
 
 const lmFilesToCopy = [
   'server.mjs',
+  'paths.mjs',
+  'migration.mjs',
   'orchestrator.mjs',
   'worker.mjs',
   'reachability.mjs',
   'hunter.mjs',
   'extractor_sync.mjs',
   'auth.mjs',
+  'url_importer.mjs',
+  'db_migration.mjs',
   'config.json',
   'launch.ps1'
 ];
@@ -48,7 +52,17 @@ const lmFilesToCopy = [
 for (const file of lmFilesToCopy) {
   const src = path.join(__dirname, file);
   if (fs.existsSync(src)) {
-    fs.copyFileSync(src, path.join(targetLmDir, file));
+    if (file === 'config.json') {
+      try {
+        const raw = JSON.parse(fs.readFileSync(src, 'utf8'));
+        delete raw.license;
+        fs.writeFileSync(path.join(targetLmDir, file), JSON.stringify(raw, null, 2), 'utf8');
+      } catch (_) {
+        fs.copyFileSync(src, path.join(targetLmDir, file));
+      }
+    } else {
+      fs.copyFileSync(src, path.join(targetLmDir, file));
+    }
   }
 }
 
@@ -88,7 +102,7 @@ for (const f of launchers) {
 // Write streamlined, bloat-free package.json (fast npm install)
 const cleanPkg = {
   name: 'lead-machine',
-  version: '2.0.0',
+  version: '2.4.2',
   private: true,
   type: 'module',
   dependencies: {
@@ -118,8 +132,10 @@ cleanDb.exec(`
     phone TEXT,
     email TEXT,
     contact_person TEXT,
-    status TEXT DEFAULT 'not_contacted' CHECK(status IN ('not_contacted', 'pending', 'contacted', 'responded', 'unable_to_reach', 'won', 'closed')),
+    status TEXT DEFAULT 'not_contacted',
     notes TEXT,
+    failure_reason TEXT,
+    debug_screenshot TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
