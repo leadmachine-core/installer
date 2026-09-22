@@ -1,10 +1,18 @@
 import crypto from 'crypto';
+import dns from 'dns';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// Prioritize IPv4 on virtualized / VM networks (fixes UTM/QEMU/Hyper-V IPv6 timeout)
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
+import { getConfigPath } from './paths.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.resolve(__dirname, 'config.json');
+const getConfigFilePath = () => getConfigPath();
 
 // Official GitHub license vault URL (leadmachine-core/licenses)
 // Can be overridden via config.json -> settings.licenseVaultUrl
@@ -26,8 +34,9 @@ export function maskKey(rawKey) {
 
 function readConfig() {
   try {
-    if (fs.existsSync(configPath)) {
-      return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const cfgPath = getConfigFilePath();
+    if (fs.existsSync(cfgPath)) {
+      return JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
     }
   } catch (_) {}
   return {};
@@ -35,7 +44,9 @@ function readConfig() {
 
 function writeConfig(cfg) {
   try {
-    fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), 'utf8');
+    const cfgPath = getConfigFilePath();
+    fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
     return true;
   } catch (err) {
     console.error('[Auth] Failed to write config.json:', err.message);
@@ -48,6 +59,89 @@ export const TIER_LIMITS = {
   Pro: { maxHunterLeads: 3000, maxWorkers: 3, canExportCsv: true, label: 'Professional' },
   Enterprise: { maxHunterLeads: 100000, maxWorkers: 6, canExportCsv: true, label: 'Enterprise' }
 };
+
+import { execSync } from 'child_process';
+import os from 'os';
+
+let cachedHardwareId = null;
+
+export function getSystemHardwareId() {
+  if (cachedHardwareId) return cachedHardwareId;
+
+  // 1. Check persistent hardware token file on system
+  const isWin = process.platform === 'win32';
+  const tokenDir = isWin
+    ? path.join(process.env.APPDATA || process.env.USERPROFILE || 'C:\\ProgramData', 'LeadMachine')
+    : path.join(os.homedir(), '.leadmachine');
+  const tokenFile = path.join(tokenDir, '.machine_id');
+
+  try {
+    if (fs.existsSync(tokenFile)) {
+      const saved = fs.readFileSync(tokenFile, 'utf8').trim();
+      if (saved && saved.startsWith('HW-') && saved.length === 35) {
+        cachedHardwareId = saved;
+        return cachedHardwareId;
+      }
+    }
+  } catch (_) {}
+
+  // 2. Derive permanent hardware UUID from OS
+  let rawUuid = '';
+  try {
+    if (isWin) {
+      try {
+        rawUuid = execSync('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"', { encoding: 'utf8', timeout: 3500 }).trim();
+      } catch (_) {
+        try {
+          rawUuid = execSync('wmic csproduct get uuid', { encoding: 'utf8', timeout: 3500 }).replace(/uuid/i, '').trim();
+        } catch (_) {
+          try {
+            rawUuid = execSync('powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Get-ItemProperty -Path \'Registry::HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography\').MachineGuid"', { encoding: 'utf8', timeout: 3500 }).trim();
+          } catch (_) {}
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      try {
+        const out = execSync('ioreg -rd1 -c IOPlatformExpertDevice', { encoding: 'utf8', timeout: 3000 });
+        const m = out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+        if (m && m[1]) rawUuid = m[1].trim();
+      } catch (_) {}
+    } else {
+      for (const p of ['/etc/machine-id', '/var/lib/dbus/machine-id']) {
+        if (fs.existsSync(p)) {
+          rawUuid = fs.readFileSync(p, 'utf8').trim();
+          if (rawUuid) break;
+        }
+      }
+    }
+  } catch (_) {}
+
+  // 3. Fallback to network MAC + CPU if UUID empty
+  if (!rawUuid || rawUuid === '00000000-0000-0000-0000-000000000000') {
+    const net = os.networkInterfaces();
+    let mac = '';
+    for (const k of Object.keys(net)) {
+      for (const item of net[k] || []) {
+        if (item.mac && item.mac !== '00:00:00:00:00:00' && !item.internal) {
+          mac = item.mac;
+          break;
+        }
+      }
+      if (mac) break;
+    }
+    rawUuid = `${os.hostname()}-${os.cpus()[0]?.model || ''}-${mac}-${os.totalmem()}`;
+  }
+
+  const hash = crypto.createHash('sha256').update(rawUuid).digest('hex').slice(0, 32).toUpperCase();
+  cachedHardwareId = `HW-${hash}`;
+
+  try {
+    fs.mkdirSync(tokenDir, { recursive: true });
+    fs.writeFileSync(tokenFile, cachedHardwareId, 'utf8');
+  } catch (_) {}
+
+  return cachedHardwareId;
+}
 
 export function getTierLimits(tier) {
   if (!tier || typeof tier !== 'string') return TIER_LIMITS.Enterprise;
@@ -121,6 +215,20 @@ export function getAuthStatus() {
     }
   }
 
+  // 4. Hardware ID single-device binding check
+  const currentHw = getSystemHardwareId();
+  if (lic.boundHardwareId && lic.boundHardwareId !== currentHw) {
+    return {
+      authenticated: false,
+      clientName: lic.clientName,
+      keyMask: lic.keyMask,
+      tier: lic.tier || 'Enterprise',
+      status: 'hardware_mismatch',
+      error: 'License Key locked to another computer. Enterprise keys are strictly single-device.',
+      limits: null
+    };
+  }
+
   const tier = lic.tier || 'Enterprise';
   return {
     authenticated: true,
@@ -130,6 +238,7 @@ export function getAuthStatus() {
     expires: lic.expires || null,
     status: 'active',
     lastVerified: lic.lastVerified || null,
+    boundHardwareId: lic.boundHardwareId || currentHw,
     limits: getTierLimits(tier)
   };
 }
@@ -179,6 +288,13 @@ export async function verifyRemoteKey(rawKey, customVaultUrl = null) {
               error: data.reason || 'This License Key has been revoked or suspended by the administrator.'
             };
           }
+          const currentHw = getSystemHardwareId();
+          if (data.boundHardwareId && data.boundHardwareId !== currentHw) {
+            return {
+              valid: false,
+              error: 'This License Key is already bound to another computer. Enterprise licenses are strictly single-device. Please contact your administrator to request a license reset.'
+            };
+          }
           return {
             valid: true,
             clientName: data.name || 'Enterprise Client',
@@ -208,6 +324,15 @@ export async function verifyRemoteKey(rawKey, customVaultUrl = null) {
       };
     }
 
+    // Check hardware lock
+    const currentHw = getSystemHardwareId();
+    if (data.boundHardwareId && data.boundHardwareId !== currentHw) {
+      return {
+        valid: false,
+        error: 'This License Key is already bound to another computer. Enterprise licenses are strictly single-device. Please contact your administrator to request a license reset.'
+      };
+    }
+
     // Check expiration if specified
     if (data.expires) {
       const expDate = new Date(data.expires);
@@ -227,6 +352,13 @@ export async function verifyRemoteKey(rawKey, customVaultUrl = null) {
   } catch (err) {
     // Check if offline grace period applies
     if (cfg.license && cfg.license.key === cleanKey && cfg.license.active) {
+      const currentHw = getSystemHardwareId();
+      if (cfg.license.boundHardwareId && cfg.license.boundHardwareId !== currentHw) {
+        return {
+          valid: false,
+          error: 'License Key locked to another computer. Enterprise keys are strictly single-device.'
+        };
+      }
       const lastCheck = new Date(cfg.license.lastVerified || 0);
       const gracePeriodMs = 7 * 24 * 60 * 60 * 1000; // 7 days
       if (Date.now() - lastCheck.getTime() < gracePeriodMs) {
@@ -248,6 +380,13 @@ export async function verifyRemoteKey(rawKey, customVaultUrl = null) {
           return {
             valid: false,
             error: data.reason || 'This License Key has been revoked or suspended by the administrator.'
+          };
+        }
+        const currentHw = getSystemHardwareId();
+        if (data.boundHardwareId && data.boundHardwareId !== currentHw) {
+          return {
+            valid: false,
+            error: 'This License Key is already bound to another computer. Enterprise licenses are strictly single-device. Please contact your administrator to request a license reset.'
           };
         }
         return {
@@ -276,6 +415,8 @@ export async function activateLicense(rawKey) {
 
   const tier = result.payload?.tier || 'Enterprise';
   const expires = result.payload?.expires || null;
+  const currentHw = getSystemHardwareId();
+  const boundHardwareId = result.payload?.boundHardwareId || currentHw;
 
   cfg.license = {
     key: cleanKey,
@@ -285,8 +426,21 @@ export async function activateLicense(rawKey) {
     expires,
     active: true,
     lastVerified: new Date().toISOString(),
-    vaultHash: hashKey(cleanKey)
+    vaultHash: hashKey(cleanKey),
+    boundHardwareId
   };
+
+  // If local licenses directory exists, bind hardware locally
+  const localVaultPath = path.resolve(__dirname, '..', 'licenses', `${hashKey(cleanKey)}.json`);
+  if (fs.existsSync(localVaultPath)) {
+    try {
+      const vData = JSON.parse(fs.readFileSync(localVaultPath, 'utf8'));
+      if (!vData.boundHardwareId) {
+        vData.boundHardwareId = currentHw;
+        fs.writeFileSync(localVaultPath, JSON.stringify(vData, null, 2), 'utf8');
+      }
+    } catch (_) {}
+  }
 
   writeConfig(cfg);
   return {
@@ -295,6 +449,7 @@ export async function activateLicense(rawKey) {
     keyMask: maskKey(cleanKey),
     tier,
     expires,
+    boundHardwareId,
     limits: getTierLimits(tier)
   };
 }
