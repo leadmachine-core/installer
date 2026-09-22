@@ -5,14 +5,14 @@ setlocal enabledelayedexpansion
 :: 1. Check if running directly in an extracted LeadMachine directory
 if exist "%~dp0lead-machine\launch.ps1" (
     cd /d "%~dp0"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NoExit -File "%~dp0lead-machine\launch.ps1"
+    powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -NoExit -File "%~dp0lead-machine\launch.ps1"
     goto :done
 )
 
 :: 2. Check if installed in current user's %LOCALAPPDATA%\LeadMachine
 if exist "%LOCALAPPDATA%\LeadMachine\lead-machine\launch.ps1" (
     cd /d "%LOCALAPPDATA%\LeadMachine"
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -NoExit -File "%LOCALAPPDATA%\LeadMachine\lead-machine\launch.ps1"
+    powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -NoExit -File "%LOCALAPPDATA%\LeadMachine\lead-machine\launch.ps1"
     goto :done
 )
 
