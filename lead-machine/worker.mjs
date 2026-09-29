@@ -1433,12 +1433,14 @@ async function processLead(browser, lead, agentName, isSandbox = false) {
         return null;
       }, ERROR_SIGNALS).catch(() => null);
 
+      const isCaptcha = explicitError && /\b(captcha|recaptcha|hcaptcha|turnstile|human|security[_\s-]?question|bot|challenge|cloudflare|datadome|perimeterx|arkose|puzzle)\b/i.test(explicitError);
+      const targetStatus = isCaptcha ? 'captcha_blocked' : 'form_submit_error';
       const failureNote = explicitError ? `Submission rejected: ${explicitError}` : 'Unconfirmed post-submission';
-      console.log(`[${agentName}] ⚠️ #${lead.id} ${failureNote} (${elapsed}s)`);
+      console.log(`[${agentName}] ⚠️ #${lead.id} ${failureNote} (${elapsed}s) [status: ${targetStatus}]`);
       const shot = await captureFailureScreenshot(page, lead.id);
-      saveLeadResult(lead.id, 'form_submit_error', `Contact form: ${contactPageUrl} (${failureNote})`, isSandbox, explicitError || 'Submission unconfirmed or rejected', shot);
+      saveLeadResult(lead.id, targetStatus, `Contact form: ${contactPageUrl} (${failureNote})`, isSandbox, explicitError || 'Submission unconfirmed or rejected', shot);
       await safeClose(page);
-      return { id: lead.id, company: lead.company_name, status: 'form_submit_error', time: elapsed, result: failureNote };
+      return { id: lead.id, company: lead.company_name, status: targetStatus, time: elapsed, result: failureNote };
     }
 
   } catch (err) {
@@ -1463,8 +1465,9 @@ async function processLead(browser, lead, agentName, isSandbox = false) {
 
     console.log(`[${agentName}] ❌ #${lead.id} Error: ${err.message} (${elapsed}s)`);
     const isTimeout = (err.message || '').toLowerCase().includes('timeout') || (err.message || '').toLowerCase().includes('net::');
-    const targetStatus = isTimeout ? 'unreachable' : 'form_submit_error';
-    const reasonText = isTimeout ? 'Connection Timeout / DNS Failure' : `Automation Error: ${err.message.split('\n')[0]}`;
+    const isCaptcha = /\b(captcha|recaptcha|hcaptcha|turnstile|human|security[_\s-]?question|bot|challenge|cloudflare|datadome|perimeterx|arkose|puzzle)\b/i.test(err.message || '');
+    const targetStatus = isCaptcha ? 'captcha_blocked' : (isTimeout ? 'unreachable' : 'form_submit_error');
+    const reasonText = isCaptcha ? `Security Challenge / CAPTCHA: ${err.message.split('\n')[0]}` : (isTimeout ? 'Connection Timeout / DNS Failure' : `Automation Error: ${err.message.split('\n')[0]}`);
     const shot = await captureFailureScreenshot(page, lead.id);
     saveLeadResult(lead.id, targetStatus, `Error during browser automation: ${err.message.split('\n')[0]}`, isSandbox, reasonText, shot);
     await safeClose(page);
@@ -1493,36 +1496,87 @@ async function runWorker() {
     } catch (_) {}
   }
 
-  const instProfile = path.join(os.tmpdir(), `leadmachine_w${workerId}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`);
-  fs.mkdirSync(instProfile, { recursive: true });
+  let currentBrowser = null;
+  let currentInstProfile = null;
 
-  let browser = await puppeteer.launch({
-    executablePath: CHROME_BIN,
-    headless: isHeaded ? false : 'new',
-    userDataDir: instProfile,
-    timeout: 60000,
-    ignoreHTTPSErrors: true,
-    args: STEALTH_LAUNCH_ARGS
+  const cleanupBrowser = async () => {
+    if (currentBrowser) {
+      const b = currentBrowser;
+      currentBrowser = null;
+      const browserPid = b.process() ? b.process().pid : null;
+      try {
+        const pages = await b.pages();
+        for (const p of pages) {
+          try { await p.close(); } catch (_) {}
+        }
+      } catch (_) {}
+      try { await b.close(); } catch (_) {}
+      if (browserPid) {
+        try {
+          if (process.platform === 'win32') {
+            execSync(`taskkill /pid ${browserPid} /T /F`, { stdio: 'ignore' });
+          } else {
+            execSync(`pkill -9 -P ${browserPid} 2>/dev/null || true`, { stdio: 'ignore' });
+            try { process.kill(browserPid, 'SIGKILL'); } catch (_) {}
+          }
+        } catch (_) {}
+      }
+    }
+    if (currentInstProfile) {
+      const prof = currentInstProfile;
+      currentInstProfile = null;
+      try {
+        if (process.platform !== 'win32') {
+          execSync(`pkill -9 -f "${path.basename(prof)}" 2>/dev/null || true`, { stdio: 'ignore' });
+        }
+        fs.rmSync(prof, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  };
+
+  const handleShutdown = async (sigCode) => {
+    await cleanupBrowser();
+    try { db.close(); } catch (_) {}
+    process.exit(sigCode);
+  };
+
+  process.on('SIGTERM', () => handleShutdown(143));
+  process.on('SIGINT', () => handleShutdown(130));
+  process.on('exit', () => {
+    if (currentInstProfile && process.platform !== 'win32') {
+      try { execSync(`pkill -9 -f "${path.basename(currentInstProfile)}" 2>/dev/null || true`, { stdio: 'ignore' }); } catch (_) {}
+      try { fs.rmSync(currentInstProfile, { recursive: true, force: true }); } catch (_) {}
+    }
   });
+
+  const launchFreshBrowser = async () => {
+    await cleanupBrowser();
+    currentInstProfile = path.join(os.tmpdir(), `leadmachine_w${workerId}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(currentInstProfile, { recursive: true });
+    currentBrowser = await puppeteer.launch({
+      executablePath: CHROME_BIN,
+      headless: isHeaded ? false : 'new',
+      userDataDir: currentInstProfile,
+      timeout: 60000,
+      ignoreHTTPSErrors: true,
+      args: STEALTH_LAUNCH_ARGS
+    });
+    return currentBrowser;
+  };
+
+  await launchFreshBrowser();
 
   const placeholders = leadIds.map(() => '?').join(',');
   const leads = db.prepare(`SELECT id, company_name, website FROM leads WHERE id IN (${placeholders}) ORDER BY id ASC`).all(...leadIds);
 
   const results = [];
   for (const lead of leads) {
-    if (!browser || !browser.connected) {
-      browser = await puppeteer.launch({
-        executablePath: CHROME_BIN,
-        headless: isHeaded ? false : 'new',
-        userDataDir: instProfile,
-        timeout: 60000,
-        ignoreHTTPSErrors: true,
-        args: STEALTH_LAUNCH_ARGS
-      });
+    if (!currentBrowser || !currentBrowser.connected) {
+      await launchFreshBrowser();
     }
     try {
       const res = await Promise.race([
-        processLead(browser, lead, agentName, isSandbox),
+        processLead(currentBrowser, lead, agentName, isSandbox),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout (75s)')), 75000))
       ]);
       results.push(res);
@@ -1534,11 +1588,17 @@ async function runWorker() {
       const errRes = { id: lead.id, company: lead.company_name, status: 'unable_to_reach', result: e.message };
       results.push(errRes);
       console.log(`EVENT_LEAD_RESULT:${JSON.stringify(errRes)}`);
+
+      // If a timeout occurred, the browser is likely hung/frozen with pending page tasks.
+      // Recycle browser immediately so next lead starts with a pristine session!
+      if (e.message && e.message.includes('Timeout')) {
+        console.log(`[${agentName}] ♻️ Recycling browser after timeout on #${lead.id} to prevent zombie renderers.`);
+        await launchFreshBrowser().catch(() => {});
+      }
     }
   }
 
-  try { await browser.close(); } catch (_) {}
-  try { fs.rmSync(instProfile, { recursive: true, force: true }); } catch (_) {}
+  await cleanupBrowser();
   try { db.close(); } catch (_) {}
 
   console.log(`🏁 [${agentName}] Completed batch of ${results.length} leads.`);

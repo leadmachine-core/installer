@@ -109,6 +109,11 @@ export class CampaignOrchestrator extends EventEmitter {
 
   cleanTempProfiles() {
     try {
+      if (this.activeChildren.size === 0 && process.platform !== 'win32') {
+        try {
+          execSync('pkill -9 -f "leadmachine_w" 2>/dev/null || true', { stdio: 'ignore' });
+        } catch (_) {}
+      }
       const tmp = os.tmpdir();
       const files = fs.readdirSync(tmp);
       for (const f of files) {
@@ -283,8 +288,8 @@ export class CampaignOrchestrator extends EventEmitter {
     try {
       const dbCheck = this.getDb();
       let uncontactedCount = 0;
-      if (stateFilter && stateFilter !== 'all') {
-        uncontactedCount = dbCheck.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted' AND state = ?").get(stateFilter)?.c || 0;
+      if (stateFilter && stateFilter !== 'all' && !stateFilter.toLowerCase().startsWith('all ')) {
+        uncontactedCount = dbCheck.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted' AND (state = ? OR country = ?)").get(stateFilter, stateFilter)?.c || 0;
       } else {
         uncontactedCount = dbCheck.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted'").get()?.c || 0;
       }
@@ -359,9 +364,9 @@ export class CampaignOrchestrator extends EventEmitter {
       const db = this.getDb();
       let query = "SELECT id, company_name, website FROM leads WHERE status = 'not_contacted'";
       const params = [];
-      if (stateFilter && stateFilter !== 'all') {
-        query += " AND state = ?";
-        params.push(stateFilter);
+      if (stateFilter && stateFilter !== 'all' && !stateFilter.toLowerCase().startsWith('all ')) {
+        query += " AND (state = ? OR country = ?)";
+        params.push(stateFilter, stateFilter);
       }
       query += " ORDER BY id ASC LIMIT ?";
       params.push(fetchLimit);
@@ -383,8 +388,8 @@ export class CampaignOrchestrator extends EventEmitter {
             await new Promise(r => setTimeout(r, 2000));
             waitCycles++;
             const dbPoll = this.getDb();
-            const countCheck = stateFilter && stateFilter !== 'all'
-              ? (dbPoll.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted' AND state = ?").get(stateFilter)?.c || 0)
+            const countCheck = stateFilter && stateFilter !== 'all' && !stateFilter.toLowerCase().startsWith('all ')
+              ? (dbPoll.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted' AND (state = ? OR country = ?)").get(stateFilter, stateFilter)?.c || 0)
               : (dbPoll.prepare("SELECT count(*) as c FROM leads WHERE status = 'not_contacted'").get()?.c || 0);
             dbPoll.close();
             if (countCheck > 0) {
@@ -495,8 +500,17 @@ export class CampaignOrchestrator extends EventEmitter {
             // Hard watchdog: 75s per lead + 30s buffer, min 120s
             const timeoutMs = Math.max(120000, batch.length * 75000 + 30000);
             watchdog = setTimeout(() => {
-              console.warn(`[Orchestrator] Worker ${workerId} timed out after ${timeoutMs / 1000}s. Terminating child process...`);
-              try { child.kill('SIGKILL'); } catch (_) {}
+              console.warn(`[Orchestrator] Worker ${workerId} timed out after ${timeoutMs / 1000}s. Terminating process tree...`);
+              try {
+                if (child.pid) {
+                  if (process.platform === 'win32') {
+                    execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
+                  } else {
+                    execSync(`pkill -9 -P ${child.pid} 2>/dev/null || true`, { stdio: 'ignore' });
+                    try { child.kill('SIGKILL'); } catch (_) {}
+                  }
+                }
+              } catch (_) {}
               finish({ workerId, code: 124, error: 'Watchdog timeout' });
             }, timeoutMs);
 
@@ -595,13 +609,18 @@ export class CampaignOrchestrator extends EventEmitter {
     this.status = 'stopped';
     for (const child of this.activeChildren) {
       try {
-        child.kill('SIGTERM');
-        setTimeout(() => {
-          try { child.kill('SIGKILL'); } catch (_) {}
-        }, 1500);
+        if (child.pid) {
+          if (process.platform === 'win32') {
+            execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
+          } else {
+            execSync(`pkill -9 -P ${child.pid} 2>/dev/null || true`, { stdio: 'ignore' });
+            try { child.kill('SIGKILL'); } catch (_) {}
+          }
+        }
       } catch (_) {}
     }
     this.activeChildren.clear();
+    this.cleanTempProfiles();
     this.recordEvent({ type: 'campaign_stopped', message: 'Campaign stopped by user.' });
   }
 }
